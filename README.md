@@ -1035,4 +1035,1302 @@ npm audit
 
 ---
 
-End of BotGuard Shield Setup Guide.
+# BotGuard Shield — Reverse Proxy Setup Guide
+
+Complete step-by-step instructions to deploy BotGuard Shield with a reverse proxy.
+
+---
+
+## Table of Contents
+
+1. [Architecture Overview](#1-architecture-overview)
+2. [Prerequisites](#2-prerequisites)
+3. [Choose Your Deployment Model](#3-choose-your-deployment-model)
+4. [Initial Server Setup](#4-initial-server-setup)
+5. [Install Node.js and Dependencies](#5-install-nodejs-and-dependencies)
+6. [Create the Project Structure](#6-create-the-project-structure)
+7. [Place All BotGuard Files](#7-place-all-botguard-files)
+8. [Configure Environment Variables](#8-configure-environment-variables)
+9. [Option A — BotGuard in Front of NGINX](#9-option-a--botguard-in-front-of-nginx)
+10. [Option B — NGINX in Front with Auth Subrequest](#10-option-b--nginx-in-front-with-auth-subrequest)
+11. [Option C — BotGuard Inside a Node.js Reverse Proxy](#11-option-c--botguard-inside-a-nodejs-reverse-proxy)
+12. [Inject the Client-Side Script](#12-inject-the-client-side-script)
+13. [Set Up SSL/HTTPS](#13-set-up-sslhttps)
+14. [Run BotGuard as a Background Service](#14-run-botguard-as-a-background-service)
+15. [Firewall Configuration](#15-firewall-configuration)
+16. [Testing the Full Pipeline](#16-testing-the-full-pipeline)
+17. [Monitoring and Logs](#17-monitoring-and-logs)
+18. [Whitelisting Your Own IPs](#18-whitelisting-your-own-ips)
+19. [Updating Hosting IP Ranges](#19-updating-hosting-ip-ranges)
+20. [Troubleshooting](#20-troubleshooting)
+21. [Production Checklist](#21-production-checklist)
+
+---
+
+## 1. Architecture Overview
+
+BotGuard Shield is a 5-layer sequential filter pipeline. Every incoming request passes through each filter in order. If ANY filter fails, the visitor is immediately redirected to google.com. Only requests that pass all 5 filters reach your actual website.
+
+The 5 filters in order:
+
+```
+Filter 1: Browser Automation Detection
+Filter 2: Hosting Provider / Data Center IP Detection
+Filter 3: BotGuard (Proof-of-Work, Request Patterns, Honeypots)
+Filter 4: Search Engine Robot Detection
+Filter 5: Hardware Virtualization Detection
+```
+
+The traffic flow with a reverse proxy:
+
+```
+Internet
+   |
+   v
+[NGINX / Load Balancer] (SSL termination, rate limiting)
+   |
+   v
+[BotGuard Shield] (5-filter pipeline)
+   |
+   v
+[Your Backend Servers] (only clean, verified traffic arrives here)
+```
+
+OR the alternative flow where BotGuard sits in front:
+
+```
+Internet
+   |
+   v
+[BotGuard Shield] (port 443/80, 5-filter pipeline)
+   |
+   v
+[NGINX / Reverse Proxy] (routing, load balancing)
+   |
+   v
+[Your Backend Servers]
+```
+
+---
+
+## 2. Prerequisites
+
+Before starting, make sure you have the following:
+
+- A Linux server (Ubuntu 20.04/22.04/24.04, Debian 11/12, or CentOS 8/9)
+- Root or sudo access
+- A domain name pointed to your server IP
+- NGINX installed (or you will install it in this guide)
+- Node.js 18 or higher
+- npm 9 or higher
+- At least 1 GB RAM
+- At least 10 GB disk space
+- Ports 80 and 443 open in your firewall
+
+---
+
+## 3. Choose Your Deployment Model
+
+There are three ways to deploy BotGuard with a reverse proxy. Read all three and pick the one that fits your setup.
+
+**Option A — BotGuard in front of NGINX**
+
+- BotGuard listens on a port (e.g., 3000)
+- NGINX listens on port 80/443 and forwards to BotGuard on port 3000
+- BotGuard filters the request, then forwards clean traffic to your backend
+- Best for: new setups, simple architectures
+
+**Option B — NGINX in front with auth subrequest**
+
+- NGINX stays as your main reverse proxy on port 80/443
+- On every request, NGINX calls BotGuard via auth_request to check if the visitor should be allowed
+- BotGuard returns 200 (allow) or 403 (block)
+- NGINX redirects blocked visitors to google.com
+- Best for: existing NGINX setups you do not want to restructure
+
+**Option C — BotGuard inside a Node.js reverse proxy**
+
+- Your reverse proxy is already a Node.js/Express application
+- You add the BotGuard filters as middleware directly into your existing proxy code
+- No separate BotGuard service needed
+- Best for: existing Node.js based proxies
+
+---
+
+## 4. Initial Server Setup
+
+Step 4.1 — Update your system:
+
+```
+sudo apt update && sudo apt upgrade -y
+```
+
+Step 4.2 — Install essential tools:
+
+```
+sudo apt install -y curl wget git build-essential
+```
+
+Step 4.3 — Install NGINX:
+
+```
+sudo apt install -y nginx
+sudo systemctl enable nginx
+sudo systemctl start nginx
+```
+
+Step 4.4 — Verify NGINX is running:
+
+```
+sudo systemctl status nginx
+curl http://localhost
+```
+
+You should see the NGINX default welcome page.
+
+---
+
+## 5. Install Node.js and Dependencies
+
+Step 5.1 — Install Node.js 20 LTS:
+
+```
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+```
+
+Step 5.2 — Verify installation:
+
+```
+node --version
+npm --version
+```
+
+node should show v20.x.x or higher. npm should show 9.x.x or higher.
+
+Step 5.3 — Install PM2 globally (process manager for production):
+
+```
+sudo npm install -g pm2
+```
+
+---
+
+## 6. Create the Project Structure
+
+Step 6.1 — Create the project directory:
+
+```
+sudo mkdir -p /opt/botguard-shield
+sudo chown $USER:$USER /opt/botguard-shield
+cd /opt/botguard-shield
+```
+
+Step 6.2 — Create all subdirectories:
+
+```
+mkdir -p filters
+mkdir -p public
+mkdir -p data
+mkdir -p logs
+```
+
+Step 6.3 — Initialize npm and install dependencies:
+
+```
+npm init -y
+npm install express express-rate-limit node-fetch@2 dotenv ua-parser-js http-proxy-middleware
+```
+
+Note: We use node-fetch version 2 because version 3 is ESM-only and causes issues with require().
+
+Step 6.4 — Verify your directory looks like this:
+
+```
+/opt/botguard-shield/
+├── node_modules/
+├── package.json
+├── package-lock.json
+├── filters/
+├── public/
+├── data/
+└── logs/
+```
+
+---
+
+## 7. Place All BotGuard Files
+
+You should have downloaded the following documents from the previous session. Place each file in the correct location:
+
+Step 7.1 — From Part 1 document, copy and save:
+
+- package.json content into /opt/botguard-shield/package.json (or keep the one npm generated)
+- .env content into /opt/botguard-shield/.env
+- filter1-browser-automation.js into /opt/botguard-shield/filters/filter1-browser-automation.js
+- filter2-hosting-provider.js into /opt/botguard-shield/filters/filter2-hosting-provider.js
+
+Step 7.2 — From Part 2 document, copy and save:
+
+- filter3-botguard.js into /opt/botguard-shield/filters/filter3-botguard.js
+- filter4-search-engine-robots.js into /opt/botguard-shield/filters/filter4-search-engine-robots.js
+
+Step 7.3 — From Part 3 document, copy and save:
+
+- filter5-hardware-virtualization.js into /opt/botguard-shield/filters/filter5-hardware-virtualization.js
+
+Step 7.4 — From Part 5 (Client Side) document, copy and save:
+
+- botguard-client.js into /opt/botguard-shield/public/botguard-client.js
+- index.html into /opt/botguard-shield/public/index.html
+
+Step 7.5 — From the hosting-ranges.json document, copy and save:
+
+- hosting-ranges.json into /opt/botguard-shield/data/hosting-ranges.json
+
+Step 7.6 — Verify all files are in place:
+
+```
+find /opt/botguard-shield -type f -name "*.js" -o -name "*.json" -o -name "*.html" -o -name ".env" | sort
+```
+
+You should see:
+
+```
+/opt/botguard-shield/.env
+/opt/botguard-shield/data/hosting-ranges.json
+/opt/botguard-shield/filters/filter1-browser-automation.js
+/opt/botguard-shield/filters/filter2-hosting-provider.js
+/opt/botguard-shield/filters/filter3-botguard.js
+/opt/botguard-shield/filters/filter4-search-engine-robots.js
+/opt/botguard-shield/filters/filter5-hardware-virtualization.js
+/opt/botguard-shield/package.json
+/opt/botguard-shield/public/botguard-client.js
+/opt/botguard-shield/public/index.html
+```
+
+---
+
+## 8. Configure Environment Variables
+
+Step 8.1 — Edit the .env file:
+
+```
+nano /opt/botguard-shield/.env
+```
+
+Step 8.2 — Set these values:
+
+```
+PORT=3000
+REDIRECT_URL=https://www.google.com
+LOG_BLOCKED=true
+BYPASS_KEY=change-this-to-a-long-random-string
+```
+
+Explanation of each variable:
+
+- PORT: The port BotGuard listens on internally. Use 3000 unless it conflicts with something.
+- REDIRECT_URL: Where blocked visitors get sent. Default is google.com.
+- LOG_BLOCKED: Set to true to log every blocked request to blocked.log. Set to false in high traffic production to save disk I/O.
+- BYPASS_KEY: A secret key you can send in the X-Bypass-Key header to skip all filters. Use this for your own monitoring tools, health checks, and admin access. Make it long and random.
+
+Step 8.3 — Generate a random bypass key:
+
+```
+openssl rand -hex 32
+```
+
+Copy the output and paste it as your BYPASS_KEY value.
+
+Step 8.4 — Save and close the file (Ctrl+X, Y, Enter in nano).
+
+---
+
+## 9. Option A — BotGuard in Front of NGINX
+
+Use this option if you want BotGuard to filter all traffic before it reaches your NGINX reverse proxy.
+
+### Step 9.1 — Create the server.js file
+
+This version of server.js runs the 5-filter pipeline and then forwards clean traffic to NGINX.
+
+Save this as /opt/botguard-shield/server.js:
+
+```
+require("dotenv").config();
+
+const express = require("express");
+const path = require("path");
+const { createProxyMiddleware } = require("http-proxy-middleware");
+
+const filter1 = require("./filters/filter1-browser-automation");
+const filter2 = require("./filters/filter2-hosting-provider");
+const filter3 = require("./filters/filter3-botguard");
+const filter4 = require("./filters/filter4-search-engine-robots");
+const filter5 = require("./filters/filter5-hardware-virtualization");
+
+const { storeClientReport } = require("./filters/filter3-botguard");
+const { storeVMReport } = require("./filters/filter5-hardware-virtualization");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const REDIRECT_URL = process.env.REDIRECT_URL || "https://www.google.com";
+const BYPASS_KEY = process.env.BYPASS_KEY || "";
+const LOG_BLOCKED = process.env.LOG_BLOCKED === "true";
+
+// Your NGINX reverse proxy address
+// Change this to wherever NGINX is listening
+const BACKEND_PROXY = "http://127.0.0.1:8080";
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.set("trust proxy", true);
+
+// Serve client-side detection script
+app.use("/botguard-client.js", express.static(path.join(__dirname, "public", "botguard-client.js")));
+
+// Report endpoints — excluded from filtering
+app.post("/api/bot-report", (req, res) => {
+    const ip = (req.ip || "").replace(/^::ffff:/, "");
+    storeClientReport(ip, req.body);
+    res.status(204).end();
+});
+
+app.post("/api/vm-report", (req, res) => {
+    const ip = (req.ip || "").replace(/^::ffff:/, "");
+    storeVMReport(ip, req.body);
+    res.status(204).end();
+});
+
+app.post("/api/bot-log", (req, res) => {
+    const ip = (req.ip || "").replace(/^::ffff:/, "");
+    console.log("Client-side block from " + ip + ":", JSON.stringify(req.body));
+    res.status(204).end();
+});
+
+// Main pipeline middleware
+async function botGuardPipeline(req, res, next) {
+    const skipPaths = ["/api/bot-report", "/api/vm-report", "/api/bot-log"];
+    if (skipPaths.includes(req.path)) return next();
+
+    if (BYPASS_KEY && req.headers["x-bypass-key"] === BYPASS_KEY) return next();
+
+    const ip = (req.ip || "").replace(/^::ffff:/, "");
+    const startTime = Date.now();
+
+    // Filter 1
+    const f1 = filter1(req);
+    if (!f1.passed) return blockAndRedirect(req, res, f1, ip, startTime);
+
+    // Filter 2
+    const f2 = await filter2(req);
+    if (!f2.passed) return blockAndRedirect(req, res, f2, ip, startTime);
+
+    // Filter 3
+    const f3 = filter3(req);
+    if (!f3.passed) return blockAndRedirect(req, res, f3, ip, startTime);
+
+    // Filter 4
+    const f4 = await filter4(req);
+    if (!f4.passed) return blockAndRedirect(req, res, f4, ip, startTime);
+
+    // Filter 5
+    const f5 = filter5(req);
+    if (!f5.passed) return blockAndRedirect(req, res, f5, ip, startTime);
+
+    // All passed
+    const elapsed = Date.now() - startTime;
+    console.log("PASSED | IP: " + ip + " | Path: " + req.path + " | Time: " + elapsed + "ms");
+    next();
+}
+
+function blockAndRedirect(req, res, filterResult, ip, startTime) {
+    const elapsed = Date.now() - startTime;
+    console.log("BLOCKED | IP: " + ip + " | Filter: " + filterResult.filterName + " | Reason: " + filterResult.reason + " | Time: " + elapsed + "ms");
+
+    if (LOG_BLOCKED) {
+        const fs = require("fs");
+        const logEntry = {
+            timestamp: new Date().toISOString(),
+            ip: ip,
+            filter: filterResult.filterName,
+            reason: filterResult.reason,
+            path: req.path,
+            ua: req.headers["user-agent"] || "",
+            processingTimeMs: elapsed
+        };
+        fs.appendFileSync("/opt/botguard-shield/logs/blocked.log", JSON.stringify(logEntry) + "
+");
+    }
+
+    const isAjax = req.xhr || (req.headers["accept"] || "").includes("application/json");
+    if (isAjax) {
+        return res.status(403).json({ error: "Access denied", redirect: REDIRECT_URL });
+    }
+    return res.redirect(302, REDIRECT_URL);
+}
+
+// Apply pipeline
+app.use(botGuardPipeline);
+
+// Forward clean traffic to NGINX
+app.use("/", createProxyMiddleware({
+    target: BACKEND_PROXY,
+    changeOrigin: true,
+    ws: true,
+    xfwd: true,
+    onProxyReq: (proxyReq, req) => {
+        proxyReq.setHeader("X-Real-IP", req.ip || "");
+        proxyReq.setHeader("X-BotGuard-Verified", "true");
+    }
+}));
+
+app.listen(PORT, () => {
+    console.log("BotGuard Shield running on port " + PORT);
+    console.log("Forwarding clean traffic to " + BACKEND_PROXY);
+    console.log("Redirect URL: " + REDIRECT_URL);
+});
+```
+
+### Step 9.2 — Configure NGINX to listen on port 8080
+
+Edit your NGINX config:
+
+```
+sudo nano /etc/nginx/sites-available/default
+```
+
+Change the listen port from 80 to 8080:
+
+```
+server {
+    listen 8080;
+    server_name yourdomain.com;
+
+    # Only accept requests from BotGuard (localhost)
+    allow 127.0.0.1;
+    deny all;
+
+    # Verify the request came through BotGuard
+    if ($http_x_botguard_verified != "true") {
+        return 403;
+    }
+
+    # Your existing proxy_pass or root directives
+    location / {
+        proxy_pass http://your-backend-server:port;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $http_x_real_ip;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+### Step 9.3 — Add a front-facing NGINX server block on port 80/443
+
+This block receives traffic from the internet and sends it to BotGuard:
+
+```
+server {
+    listen 80;
+    server_name yourdomain.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+### Step 9.4 — Test and restart NGINX:
+
+```
+sudo nginx -t
+sudo systemctl restart nginx
+```
+
+### Step 9.5 — Start BotGuard:
+
+```
+cd /opt/botguard-shield
+node server.js
+```
+
+You should see:
+
+```
+BotGuard Shield running on port 3000
+Forwarding clean traffic to http://127.0.0.1:8080
+```
+
+### Step 9.6 — Verify the traffic flow:
+
+The request path is now:
+
+```
+Visitor browser → yourdomain.com:80 → NGINX (port 80) → BotGuard (port 3000) → NGINX (port 8080) → Your backend
+```
+
+---
+
+## 10. Option B — NGINX in Front with Auth Subrequest
+
+Use this option if NGINX is already your main reverse proxy and you do not want to change the traffic flow.
+
+### Step 10.1 — Create the server.js file for auth mode
+
+Save this as /opt/botguard-shield/server.js:
+
+```
+require("dotenv").config();
+
+const express = require("express");
+const path = require("path");
+
+const filter1 = require("./filters/filter1-browser-automation");
+const filter2 = require("./filters/filter2-hosting-provider");
+const filter3 = require("./filters/filter3-botguard");
+const filter4 = require("./filters/filter4-search-engine-robots");
+const filter5 = require("./filters/filter5-hardware-virtualization");
+
+const { storeClientReport } = require("./filters/filter3-botguard");
+const { storeVMReport } = require("./filters/filter5-hardware-virtualization");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const BYPASS_KEY = process.env.BYPASS_KEY || "";
+const LOG_BLOCKED = process.env.LOG_BLOCKED === "true";
+
+app.use(express.json());
+app.set("trust proxy", true);
+
+// Serve client-side script
+app.use("/botguard-client.js", express.static(path.join(__dirname, "public", "botguard-client.js")));
+
+// Report endpoints
+app.post("/api/bot-report", (req, res) => {
+    const ip = (req.ip || "").replace(/^::ffff:/, "");
+    storeClientReport(ip, req.body);
+    res.status(204).end();
+});
+
+app.post("/api/vm-report", (req, res) => {
+    const ip = (req.ip || "").replace(/^::ffff:/, "");
+    storeVMReport(ip, req.body);
+    res.status(204).end();
+});
+
+app.post("/api/bot-log", (req, res) => {
+    res.status(204).end();
+});
+
+// Auth check endpoint — NGINX calls this on every request
+app.get("/auth-check", async (req, res) => {
+    if (BYPASS_KEY && req.headers["x-bypass-key"] === BYPASS_KEY) {
+        return res.status(200).end();
+    }
+
+    const fakeReq = {
+        ip: req.headers["x-real-ip"] || req.ip,
+        path: req.headers["x-original-uri"] || "/",
+        method: req.headers["x-original-method"] || "GET",
+        httpVersion: req.httpVersion,
+        headers: {
+            "user-agent": req.headers["x-original-ua"] || req.headers["user-agent"] || "",
+            "accept": req.headers["x-original-accept"] || req.headers["accept"] || "",
+            "accept-language": req.headers["x-original-accept-language"] || req.headers["accept-language"] || "",
+            "accept-encoding": req.headers["x-original-accept-encoding"] || req.headers["accept-encoding"] || "",
+            "sec-ch-ua": req.headers["x-original-sec-ch-ua"] || req.headers["sec-ch-ua"] || "",
+            "referer": req.headers["x-original-referer"] || "",
+            "cookie": req.headers["x-original-cookie"] || "",
+            "connection": req.headers["connection"] || "",
+            "x-pow-token": req.headers["x-original-pow-token"] || "",
+            "x-vm-report": req.headers["x-original-vm-report"] || "",
+            "x-ja3-hash": req.headers["x-original-ja3"] || ""
+        },
+        connection: req.connection,
+        body: {},
+        xhr: false
+    };
+
+    const ip = (fakeReq.ip || "").replace(/^::ffff:/, "");
+
+    // Filter 1
+    const f1 = filter1(fakeReq);
+    if (!f1.passed) {
+        logBlock(ip, f1);
+        return res.status(403).end();
+    }
+
+    // Filter 2
+    const f2 = await filter2(fakeReq);
+    if (!f2.passed) {
+        logBlock(ip, f2);
+        return res.status(403).end();
+    }
+
+    // Filter 3
+    const f3 = filter3(fakeReq);
+    if (!f3.passed) {
+        logBlock(ip, f3);
+        return res.status(403).end();
+    }
+
+    // Filter 4
+    const f4 = await filter4(fakeReq);
+    if (!f4.passed) {
+        logBlock(ip, f4);
+        return res.status(403).end();
+    }
+
+    // Filter 5
+    const f5 = filter5(fakeReq);
+    if (!f5.passed) {
+        logBlock(ip, f5);
+        return res.status(403).end();
+    }
+
+    // All passed
+    console.log("PASSED | IP: " + ip + " | Path: " + fakeReq.path);
+    res.status(200).end();
+});
+
+function logBlock(ip, filterResult) {
+    console.log("BLOCKED | IP: " + ip + " | Filter: " + filterResult.filterName + " | Reason: " + filterResult.reason);
+    if (LOG_BLOCKED) {
+        const fs = require("fs");
+        const logEntry = {
+            timestamp: new Date().toISOString(),
+            ip: ip,
+            filter: filterResult.filterName,
+            reason: filterResult.reason
+        };
+        fs.appendFileSync("/opt/botguard-shield/logs/blocked.log", JSON.stringify(logEntry) + "
+");
+    }
+}
+
+app.listen(PORT, "127.0.0.1", () => {
+    console.log("BotGuard Auth Service running on 127.0.0.1:" + PORT);
+});
+```
+
+### Step 10.2 — Configure NGINX with auth_request
+
+Edit your NGINX site config:
+
+```
+sudo nano /etc/nginx/sites-available/default
+```
+
+Replace or modify to:
+
+```
+server {
+    listen 80;
+    server_name yourdomain.com;
+
+    # Auth subrequest to BotGuard
+    location = /botguard-auth {
+        internal;
+        proxy_pass http://127.0.0.1:3000/auth-check;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Original-Method $request_method;
+        proxy_set_header X-Original-UA $http_user_agent;
+        proxy_set_header X-Original-Accept $http_accept;
+        proxy_set_header X-Original-Accept-Language $http_accept_language;
+        proxy_set_header X-Original-Accept-Encoding $http_accept_encoding;
+        proxy_set_header X-Original-Sec-Ch-Ua $http_sec_ch_ua;
+        proxy_set_header X-Original-Referer $http_referer;
+        proxy_set_header X-Original-Cookie $http_cookie;
+        proxy_set_header X-Original-PoW-Token $http_x_pow_token;
+        proxy_set_header X-Original-VM-Report $http_x_vm_report;
+        proxy_set_header X-Original-JA3 $http_x_ja3_hash;
+    }
+
+    # Redirect blocked visitors to Google
+    error_page 403 = @botguard_blocked;
+    location @botguard_blocked {
+        return 302 https://www.google.com;
+    }
+
+    # Client-side script and report endpoints go directly to BotGuard
+    location = /botguard-client.js {
+        proxy_pass http://127.0.0.1:3000/botguard-client.js;
+    }
+
+    location = /api/bot-report {
+        proxy_pass http://127.0.0.1:3000/api/bot-report;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location = /api/vm-report {
+        proxy_pass http://127.0.0.1:3000/api/vm-report;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location = /api/bot-log {
+        proxy_pass http://127.0.0.1:3000/api/bot-log;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    # All other locations use auth_request
+    location / {
+        auth_request /botguard-auth;
+
+        # Your existing proxy_pass to backend
+        proxy_pass http://your-backend-server:port;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+### Step 10.3 — Test and restart NGINX:
+
+```
+sudo nginx -t
+sudo systemctl restart nginx
+```
+
+### Step 10.4 — Start BotGuard:
+
+```
+cd /opt/botguard-shield
+node server.js
+```
+
+### Step 10.5 — Verify the traffic flow:
+
+```
+Visitor browser → yourdomain.com:80 → NGINX → auth_request to BotGuard (port 3000)
+                                                  |
+                                            200 = allow → NGINX proxies to backend
+                                            403 = block → NGINX redirects to google.com
+```
+
+---
+
+## 11. Option C — BotGuard Inside a Node.js Reverse Proxy
+
+Use this option if your reverse proxy is already a Node.js application.
+
+### Step 11.1 — Add BotGuard to your existing proxy
+
+In your existing Node.js reverse proxy code, add the following:
+
+```
+// At the top of your existing proxy file, add these requires:
+const path = require("path");
+const filter1 = require("/opt/botguard-shield/filters/filter1-browser-automation");
+const filter2 = require("/opt/botguard-shield/filters/filter2-hosting-provider");
+const filter3 = require("/opt/botguard-shield/filters/filter3-botguard");
+const filter4 = require("/opt/botguard-shield/filters/filter4-search-engine-robots");
+const filter5 = require("/opt/botguard-shield/filters/filter5-hardware-virtualization");
+
+const REDIRECT_URL = "https://www.google.com";
+
+// Add this middleware BEFORE your proxy routes:
+app.use(async (req, res, next) => {
+    const skipPaths = ["/api/bot-report", "/api/vm-report", "/api/bot-log"];
+    if (skipPaths.includes(req.path)) return next();
+
+    const f1 = filter1(req);
+    if (!f1.passed) return res.redirect(302, REDIRECT_URL);
+
+    const f2 = await filter2(req);
+    if (!f2.passed) return res.redirect(302, REDIRECT_URL);
+
+    const f3 = filter3(req);
+    if (!f3.passed) return res.redirect(302, REDIRECT_URL);
+
+    const f4 = await filter4(req);
+    if (!f4.passed) return res.redirect(302, REDIRECT_URL);
+
+    const f5 = filter5(req);
+    if (!f5.passed) return res.redirect(302, REDIRECT_URL);
+
+    next();
+});
+
+// Serve client-side script
+app.use("/botguard-client.js", express.static("/opt/botguard-shield/public/botguard-client.js"));
+
+// Report endpoints
+app.post("/api/bot-report", (req, res) => res.status(204).end());
+app.post("/api/vm-report", (req, res) => res.status(204).end());
+app.post("/api/bot-log", (req, res) => res.status(204).end());
+
+// Then your existing proxy routes continue below...
+```
+
+### Step 11.2 — Install dependencies in your existing project:
+
+```
+npm install node-fetch@2 ua-parser-js
+```
+
+### Step 11.3 — Restart your proxy and test.
+
+---
+
+## 12. Inject the Client-Side Script
+
+The client-side detection script must be loaded in the browser for Filters 3 and 5 to receive client reports. You need to add a script tag to your HTML pages.
+
+### Step 12.1 — Add this script tag to the head section of every HTML page on your site:
+
+```
+<script src="/botguard-client.js"></script>
+```
+
+It must be the FIRST script tag in the head, before any other JavaScript.
+
+### Step 12.2 — If your backend is a template engine (EJS, Pug, Handlebars, etc.):
+
+Add the script tag to your base layout template so it appears on every page automatically.
+
+For EJS:
+```
+<head>
+    <script src="/botguard-client.js"></script>
+    <%- /* rest of your head content */ %>
+</head>
+```
+
+For Pug:
+```
+head
+    script(src="/botguard-client.js")
+```
+
+### Step 12.3 — If your backend is a SPA (React, Vue, Angular):
+
+Add the script tag to your public/index.html file:
+
+```
+<head>
+    <script src="/botguard-client.js"></script>
+    <!-- rest of your head -->
+</head>
+```
+
+### Step 12.4 — If you cannot modify HTML (third party backend):
+
+Use NGINX sub_filter to inject the script tag:
+
+```
+location / {
+    proxy_pass http://your-backend;
+    sub_filter '</head>' '<script src="/botguard-client.js"></script></head>';
+    sub_filter_once on;
+    proxy_set_header Accept-Encoding "";
+}
+```
+
+---
+
+## 13. Set Up SSL/HTTPS
+
+Step 13.1 — Install Certbot:
+
+```
+sudo apt install -y certbot python3-certbot-nginx
+```
+
+Step 13.2 — Obtain SSL certificate:
+
+```
+sudo certbot --nginx -d yourdomain.com -d www.yourdomain.com
+```
+
+Step 13.3 — Follow the prompts. Select option 2 to redirect all HTTP to HTTPS.
+
+Step 13.4 — Verify auto-renewal:
+
+```
+sudo certbot renew --dry-run
+```
+
+Step 13.5 — Verify HTTPS is working:
+
+```
+curl -I https://yourdomain.com
+```
+
+---
+
+## 14. Run BotGuard as a Background Service
+
+You need BotGuard to run permanently, restart on crash, and start on boot.
+
+### Method 1 — Using PM2 (recommended)
+
+Step 14.1 — Start with PM2:
+
+```
+cd /opt/botguard-shield
+pm2 start server.js --name botguard-shield
+```
+
+Step 14.2 — Save the process list:
+
+```
+pm2 save
+```
+
+Step 14.3 — Set PM2 to start on boot:
+
+```
+pm2 startup
+```
+
+Run the command it outputs (it will look like sudo env PATH=... pm2 startup ...).
+
+Step 14.4 — Useful PM2 commands:
+
+```
+pm2 status                    # Check if running
+pm2 logs botguard-shield      # View live logs
+pm2 restart botguard-shield   # Restart
+pm2 stop botguard-shield      # Stop
+pm2 monit                     # Live monitoring dashboard
+```
+
+### Method 2 — Using systemd
+
+Step 14.5 — Create a systemd service file:
+
+```
+sudo nano /etc/systemd/system/botguard.service
+```
+
+Paste this:
+
+```
+[Unit]
+Description=BotGuard Shield
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/botguard-shield
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+StandardOutput=append:/opt/botguard-shield/logs/stdout.log
+StandardError=append:/opt/botguard-shield/logs/stderr.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Step 14.6 — Enable and start:
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable botguard
+sudo systemctl start botguard
+sudo systemctl status botguard
+```
+
+---
+
+## 15. Firewall Configuration
+
+You must block direct access to your backend servers. Only BotGuard and NGINX should be able to reach them.
+
+### Using UFW (Ubuntu/Debian)
+
+Step 15.1 — Allow SSH, HTTP, HTTPS:
+
+```
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+```
+
+Step 15.2 — Block direct access to BotGuard port from outside:
+
+```
+sudo ufw deny 3000/tcp
+sudo ufw deny 8080/tcp
+```
+
+Step 15.3 — Enable firewall:
+
+```
+sudo ufw enable
+sudo ufw status
+```
+
+### Using firewalld (CentOS/RHEL)
+
+```
+sudo firewall-cmd --permanent --add-service=http
+sudo firewall-cmd --permanent --add-service=https
+sudo firewall-cmd --permanent --add-service=ssh
+sudo firewall-cmd --permanent --remove-port=3000/tcp
+sudo firewall-cmd --permanent --remove-port=8080/tcp
+sudo firewall-cmd --reload
+```
+
+---
+
+## 16. Testing the Full Pipeline
+
+After everything is set up, run these tests to verify each filter works.
+
+Test 1 — Normal browser access:
+
+Open your domain in a real browser. You should see your website normally.
+
+Test 2 — Block empty User-Agent (Filter 1):
+
+```
+curl -H "User-Agent: " https://yourdomain.com -v
+```
+
+Expected: 302 redirect to google.com
+
+Test 3 — Block bot User-Agent (Filter 1):
+
+```
+curl -H "User-Agent: python-requests/2.28.0" https://yourdomain.com -v
+```
+
+Expected: 302 redirect to google.com
+
+Test 4 — Block Selenium User-Agent (Filter 1):
+
+```
+curl -H "User-Agent: Mozilla/5.0 Selenium" https://yourdomain.com -v
+```
+
+Expected: 302 redirect to google.com
+
+Test 5 — Block wget (Filter 1):
+
+```
+wget https://yourdomain.com -O /dev/null
+```
+
+Expected: 302 redirect to google.com
+
+Test 6 — Test honeypot (Filter 3):
+
+```
+curl https://yourdomain.com/trap-endpoint-do-not-follow -v
+```
+
+Expected: 302 redirect to google.com
+
+Test 7 — Test bypass key:
+
+```
+curl -H "X-Bypass-Key: your-bypass-key-here" -H "User-Agent: curl" https://yourdomain.com -v
+```
+
+Expected: 200 OK (bypass key skips all filters)
+
+Test 8 — Test from a cloud server:
+
+SSH into an AWS/GCP/DigitalOcean server and try:
+
+```
+curl -H "User-Agent: Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: en-US" -H "Accept-Encoding: gzip" https://yourdomain.com -v
+```
+
+Expected: 302 redirect to google.com (Filter 2 blocks hosting IPs)
+
+---
+
+## 17. Monitoring and Logs
+
+Step 17.1 — Watch live blocked requests:
+
+```
+tail -f /opt/botguard-shield/logs/blocked.log
+```
+
+Step 17.2 — Count blocked requests by filter:
+
+```
+cat /opt/botguard-shield/logs/blocked.log | jq -r '.filter' | sort | uniq -c | sort -rn
+```
+
+Step 17.3 — Find top blocked IPs:
+
+```
+cat /opt/botguard-shield/logs/blocked.log | jq -r '.ip' | sort | uniq -c | sort -rn | head -20
+```
+
+Step 17.4 — Find top blocked reasons:
+
+```
+cat /opt/botguard-shield/logs/blocked.log | jq -r '.reason' | sort | uniq -c | sort -rn | head -20
+```
+
+Step 17.5 — Set up log rotation:
+
+```
+sudo nano /etc/logrotate.d/botguard
+```
+
+Paste:
+
+```
+/opt/botguard-shield/logs/*.log {
+    daily
+    missingok
+    rotate 30
+    compress
+    delaycompress
+    notifempty
+    copytruncate
+}
+```
+
+---
+
+## 18. Whitelisting Your Own IPs
+
+### Method 1 — Bypass key header
+
+Add this header to your monitoring tools, health checks, and admin requests:
+
+```
+X-Bypass-Key: your-bypass-key-value
+```
+
+### Method 2 — IP whitelist in server.js
+
+Add this at the top of the botGuardPipeline function:
+
+```
+const WHITELISTED_IPS = [
+    "1.2.3.4",        // Your office IP
+    "5.6.7.8",        // Your home IP
+    "10.0.0.0/8",     // Internal network
+    "127.0.0.1"       // Localhost
+];
+
+const clientIP = (req.ip || "").replace(/^::ffff:/, "");
+if (WHITELISTED_IPS.includes(clientIP)) return next();
+```
+
+### Method 3 — NGINX whitelist
+
+Add this before the auth_request or proxy_pass:
+
+```
+set $skip_botguard 0;
+if ($remote_addr = 1.2.3.4) {
+    set $skip_botguard 1;
+}
+if ($skip_botguard = 0) {
+    auth_request /botguard-auth;
+}
+```
+
+---
+
+## 19. Updating Hosting IP Ranges
+
+Filter 2 automatically downloads fresh IP ranges from AWS and GCP every 24 hours. The ranges are cached in /opt/botguard-shield/data/hosting-ranges.json.
+
+To manually refresh:
+
+Step 19.1 — Delete the cache:
+
+```
+rm /opt/botguard-shield/data/hosting-ranges.json
+```
+
+Step 19.2 — Restart BotGuard:
+
+```
+pm2 restart botguard-shield
+```
+
+It will re-download fresh ranges on startup.
+
+To add custom IP ranges, edit hosting-ranges.json and add your CIDR blocks to the array.
+
+---
+
+## 20. Troubleshooting
+
+Problem: All visitors are being blocked.
+Solution: Check if your NGINX is sending the correct headers to BotGuard. The most common issue is missing X-Real-IP or X-Forwarded-For headers, which causes BotGuard to see the NGINX IP instead of the real visitor IP. Make sure trust proxy is set to true and NGINX sends the real IP.
+
+Problem: Legitimate users on mobile are blocked.
+Solution: The behavioral check requires mouse movement on desktop and touch/scroll on mobile within 8 seconds. If your page loads slowly, increase the timeout in botguard-client.js. Search for setTimeout and change 8000 to 12000 or 15000.
+
+Problem: Filter 2 is not blocking hosting IPs.
+Solution: Check if hosting-ranges.json exists and has content. Check PM2 logs for errors loading IP ranges. The ip-api.com free tier has a rate limit of 45 requests per minute. If you have high traffic, consider using a paid IP reputation API.
+
+Problem: BotGuard crashes or runs out of memory.
+Solution: The IP cache in filter2 and filter3 grows over time. If you have millions of unique visitors, the cache will use a lot of memory. Add a cache size limit or use Redis instead of in-memory Maps.
+
+Problem: NGINX returns 500 instead of 302 when blocking.
+Solution: Make sure the error_page 403 directive is set correctly. Use "error_page 403 = @botguard_blocked" with the equals sign, not "error_page 403 @botguard_blocked".
+
+Problem: WebSocket connections are blocked.
+Solution: In Option A, make sure ws: true is set in createProxyMiddleware. In Option B, WebSocket upgrade requests do not go through auth_request by default. You need to handle the upgrade event separately.
+
+Problem: The client-side script is not loading.
+Solution: Check that /botguard-client.js is being served. Open browser dev tools, go to Network tab, and check if the script loads with 200 status. If using Option B, make sure the NGINX location for /botguard-client.js proxies to BotGuard.
+
+Problem: Certbot fails to obtain SSL certificate.
+Solution: Make sure your domain DNS A record points to your server IP. Make sure port 80 is open. Make sure NGINX is running and listening on port 80.
+
+Problem: I need to temporarily disable BotGuard.
+Solution: Stop the service with pm2 stop botguard-shield or systemctl stop botguard. Then either remove the auth_request line from NGINX or change the proxy_pass to go directly to your backend.
+
+---
+
+## 21. Production Checklist
+
+Before going live, verify everything on this list:
+
+- [ ] All 5 filter files are in /opt/botguard-shield/filters/
+- [ ] botguard-client.js is being served and loads in the browser
+- [ ] .env file has a strong random BYPASS_KEY
+- [ ] .env file has LOG_BLOCKED=true
+- [ ] hosting-ranges.json exists in /opt/botguard-shield/data/
+- [ ] NGINX is configured correctly (test with nginx -t)
+- [ ] SSL/HTTPS is set up and working
+- [ ] BotGuard is running via PM2 or systemd
+- [ ] BotGuard auto-starts on server reboot
+- [ ] Firewall blocks direct access to ports 3000 and 8080
+- [ ] Your own IP is whitelisted or you have the bypass key saved
+- [ ] Log rotation is configured
+- [ ] You tested with curl and confirmed bots are blocked
+- [ ] You tested with a real browser and confirmed access works
+- [ ] You tested from a cloud server and confirmed hosting IPs are blocked
+- [ ] Backend servers check for X-BotGuard-Verified header
+- [ ] The client-side script tag is in the head of all HTML pages
+- [ ] Report endpoints (/api/bot-report, /api/vm-report, /api/bot-log) are accessible
+- [ ] DNS is pointing to the correct server
+- [ ] You have SSH access saved in case you lock yourself out
+
+---
+
+This completes the setup. Your website is now protected by 5 layers of bot detection, both server-side and client-side, with all failed checks redirecting to google.com.
+
